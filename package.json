@@ -1,0 +1,13 @@
+{
+  "name": "ca247-vapi-silence-poc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated POC: Vapi Server URL webhook implementing the CA247-backend staged silence-close state machine. Not connected to Telnyx or production CA247.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
