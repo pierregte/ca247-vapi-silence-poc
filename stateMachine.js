@@ -31,6 +31,9 @@
  *   ACTIVE -> (idle timer fires) -> WAITING_FOR_RESPONSE
  *   WAITING_FOR_RESPONSE -> (customer speech) -> ACTIVE            [recovery]
  *   WAITING_FOR_RESPONSE -> (wait timer fires) -> CLOSING
+ *   CLOSING -> (customer speech, i.e. interruption) -> ACTIVE      [recovery]
+ *   CLOSING -> (assistant_speech_stopped, i.e. closing finished
+ *               uninterrupted) -> ENDED, end-call command sent
  *   any -> ENDED  [on end-of-call-report / status-update:ended]
  *
  * Idempotency: every timer arm increments a per-call `generation` counter.
@@ -40,6 +43,28 @@
  * or late-firing callback is therefore a guaranteed no-op -- this covers
  * duplicate webhook delivery, duplicate timer callbacks, and callbacks that
  * outlive a state change (e.g. recovery, or an already-active new episode).
+ *
+ * CLOSING redesign (2026-08-26, post-deployment Test #3 finding): CLOSING
+ * previously issued a single atomic Vapi `say` control command with
+ * `endCallAfterSpoken: true`. Live Test #3 proved this gives the caller no
+ * way to cancel the pending hangup -- Render's logs showed zero customer
+ * speech-update events were ever received during CLOSING (8.6s window,
+ * call 01a03d4c-2333-7666-a295-5568b634d46b), yet the call still ended the
+ * instant the closing line finished playing, because that decision was
+ * baked into the one atomic command already sent. CLOSING is now two
+ * separate, individually-documented Vapi Live Call Control commands:
+ *   1. `say` with `endCallAfterSpoken: false` -- speaks the closing line
+ *      only, with no automatic hangup attached.
+ *   2. A separate `end-call` command, sent only after CA247 observes the
+ *      closing utterance's own `assistant_speech_stopped` event with no
+ *      intervening customer speech -- i.e. it finished uninterrupted.
+ * If genuine customer speech (a `customer_speech` event) arrives first,
+ * CLOSING is abandoned, no `end-call` is ever sent, and the call returns to
+ * ACTIVE so normal conversation can resume -- mirroring the existing
+ * WAITING_FOR_RESPONSE recovery path. This relies only on the two
+ * independently-documented control message types (`say`, `end-call`); it
+ * does not depend on the undocumented (for the REST controlUrl path)
+ * `interruptionsEnabled` / `interruptAssistantEnabled` SayMessage fields.
  */
 
 const STATES = Object.freeze({
@@ -65,6 +90,7 @@ class CallStateMachine {
     this.clearTimeoutFn = opts.clearTimeoutFn || clearTimeout;
     this.sendCheckIn = opts.sendCheckIn || (async () => {});
     this.sendClosing = opts.sendClosing || (async () => {});
+    this.sendEndCall = opts.sendEndCall || (async () => {});
     this.onLog = opts.onLog || (() => {});
   }
 
@@ -143,7 +169,18 @@ class CallStateMachine {
     if (this.state === STATES.ACTIVE) {
       this._log('assistant_speech.stopped', {});
       this._armIdleTimer('assistant_speech_stopped');
+      return;
     }
+    if (this.state === STATES.CLOSING) {
+      // The closing utterance itself finished playing. Because CLOSING only
+      // ever sends exactly one assistant utterance (the closing line), this
+      // event unambiguously means "the closing line finished, uninterrupted"
+      // -- unless the call already left CLOSING (interruption or a stale
+      // duplicate), which the state check above/below already guards.
+      this._onClosingSpeechStopped();
+    }
+    // WAITING_FOR_RESPONSE: ignored, unchanged -- the wait window is a fixed
+    // duration from when the check-in was issued, independent of this event.
   }
 
   onCustomerSpeech() {
@@ -159,7 +196,17 @@ class CallStateMachine {
       this._transition(STATES.ACTIVE, 'customer_speech_recovery');
       return;
     }
-    // CLOSING / already past the decision point: intentionally ignored.
+    if (this.state === STATES.CLOSING) {
+      // Genuine caller speech during the closing line: abandon the pending
+      // close entirely. No end-call has been sent yet (see CLOSING redesign
+      // header comment) so there is nothing to cancel on Vapi's side --
+      // simply never send it, and return to ACTIVE so normal conversation
+      // can resume.
+      this._log('customer_speech.detected_during_closing', { note: 'interruption cancels pending close' });
+      this._transition(STATES.ACTIVE, 'customer_speech_interrupt_closing');
+      return;
+    }
+    // Already past the decision point (e.g. ENDED, handled above): ignored.
     this._log('customer_speech.ignored', { reason: `state=${this.state}` });
   }
 
@@ -197,6 +244,26 @@ class CallStateMachine {
     } catch (err) {
       this._log('closing.send_error', { error: String(err) });
       this._log('closing.fallback_to_vapi_hard_timeout', {});
+    }
+  }
+
+  // Fires when the closing utterance's own assistant_speech_stopped event
+  // arrives while still in CLOSING (see onAssistantSpeechStopped, which is
+  // the sole caller and already guards state === CLOSING). Transitions to
+  // ENDED synchronously first -- exactly mirroring _onIdleTimerFired /
+  // _onWaitTimerFired -- so any duplicate/near-simultaneous event delivered
+  // before the async end-call send resolves sees the new state immediately
+  // and is a guaranteed no-op (same idempotency guarantee as the rest of
+  // this module, without needing a separate generation counter here: the
+  // state change itself is the guard, and it happens before any await).
+  async _onClosingSpeechStopped() {
+    this._transition(STATES.ENDED, 'closing_completed_uninterrupted');
+    try {
+      await this.sendEndCall(this.controlUrl);
+      this._log('endcall.sent', {});
+    } catch (err) {
+      this._log('endcall.send_error', { error: String(err) });
+      this._log('endcall.fallback_to_vapi_hard_timeout', {});
     }
   }
 }
