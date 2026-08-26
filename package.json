@@ -5,7 +5,8 @@
   "description": "Isolated POC: Vapi Server URL webhook implementing the CA247-backend staged silence-close state machine. Not connected to Telnyx or production CA247.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/**/*.test.js"
   },
   "engines": {
     "node": ">=18.17"
