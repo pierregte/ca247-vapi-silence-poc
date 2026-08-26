@@ -88,7 +88,14 @@ function getOrCreateMachine(callId, controlUrl) {
       waitMs: SECOND_CHANCE_MS,
       controlUrl,
       sendCheckIn: (url) => sendSay(callId, url, CHECKIN_LINE, false),
-      sendClosing: (url) => sendSay(callId, url, CLOSING_LINE, true),
+      // endCallAfterSpoken is false here (was true before the 2026-08-26
+      // Test #3 finding): the closing line is now spoken with no automatic
+      // hangup attached. The call only actually ends via the separate
+      // sendEndCall command below, and only once CA247 has observed the
+      // closing utterance finish uninterrupted -- see stateMachine.js's
+      // "CLOSING redesign" header comment for the full evidence and design.
+      sendClosing: (url) => sendSay(callId, url, CLOSING_LINE, false),
+      sendEndCall: (url) => sendEndCall(callId, url),
       onLog: log,
     });
     machines.set(callId, sm);
@@ -135,6 +142,30 @@ async function sendSay(callId, controlUrl, content, endCallAfterSpoken) {
     body: JSON.stringify({ type: 'say', content, endCallAfterSpoken: !!endCallAfterSpoken }),
   });
   log({ callId, event: 'say.control_command_sent', status: res.status, ok: res.ok, endCallAfterSpoken: !!endCallAfterSpoken });
+  if (!res.ok) throw new Error(`controlUrl responded ${res.status}`);
+}
+
+// Separate, independently-documented Vapi Live Call Control command (see
+// docs.vapi.ai/calls/call-features, "4. End Call"). Sent only after CA247
+// observes the closing utterance finish uninterrupted -- see stateMachine.js
+// _onClosingSpeechStopped / the "CLOSING redesign" header comment.
+async function sendEndCall(callId, controlUrl) {
+  let url = controlUrl;
+  if (!url) url = await fetchControlUrl(callId);
+  if (!url) {
+    log({
+      callId,
+      event: 'endcall.no_control_url',
+      note: 'Cannot issue end-call command. Vapi silenceTimeoutSeconds backstop remains the fallback.',
+    });
+    throw new Error('no_control_url');
+  }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'end-call' }),
+  });
+  log({ callId, event: 'endcall.control_command_sent', status: res.status, ok: res.ok });
   if (!res.ok) throw new Error(`controlUrl responded ${res.status}`);
 }
 
